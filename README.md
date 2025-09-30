@@ -21,25 +21,13 @@ Single-file tool that:
 
 ---
 
-## Quick start
+## Quick start (no install)
 
 ```bash
 python3 homedoc_tailscale_status.py --help
 
-python3 homedoc_tailscale_status.py \
-  --ollama http://localhost:11434 \
-  --model "gemma3:12b" \
-  --llm-mode markdown \
-  --timeout 900 \
-  --num-predict 256 \
-  --stream \
-  --stream-chunk-log 0 \
-  --debug
+python3 homedoc_tailscale_status.py   --ollama http://localhost:11434   --model "gemma3:12b"   --llm-mode markdown   --timeout 900   --num-predict 256   --stream   --stream-chunk-log 0   --debug
 ```
-
----
-
-## Outputs
 
 Artifacts are written to a per-run folder under `outputs/`, e.g.:
 
@@ -55,14 +43,68 @@ outputs/tailnet-report_2025-09-30_14-07-12/
 
 ---
 
+## Install as a CLI (pipx or pip)
+
+> This repo includes a minimal `pyproject.toml` so you can install and run the tool like a proper command.
+
+### Using pipx (recommended)
+
+Isolates the tool from your system Python and keeps a clean, single-purpose environment.
+
+```bash
+# once per machine
+python3 -m pip install --user pipx
+pipx ensurepath
+
+# from the repo root
+pipx install .
+
+# run from anywhere
+homedoc-tailscale-status --help
+homedoc-tailscale-status --ollama http://localhost:11434 --model "gemma3:12b"
+```
+
+**Upgrade to the latest commit** (reinstall from the repo directory):
+
+```bash
+# from repo root after pulling updates
+pipx reinstall .
+```
+
+**Uninstall**:
+
+```bash
+pipx uninstall homedoc-tailscale-status
+```
+
+### Using pip (editable dev install)
+
+Good for local development with quick iteration.
+
+```bash
+# from repo root
+python3 -m pip install --upgrade pip
+python3 -m pip install -e .
+
+# now the CLI is available
+homedoc-tailscale-status --help
+```
+
+To remove the editable install:
+
+```bash
+python3 -m pip uninstall homedoc-tailscale-status
+```
+
+---
+
 ## CLI options (highlights)
 
 - `--out outputs` root output dir  
 - `--prefix tailnet-report` filename prefix  
 - `--flat` write files directly into `--out` (no run subdir)  
-- `--input-json PATH` use an existing Tailscale JSON file (skip calling `tailscale`)  
 - `--no-llm` skip model, write basic report only  
-- `--ollama http://host:11434` Ollama base URL  
+- `--ollama http://host:11434` ollama base URL  
 - `--model "gemma3:12b"` model tag (resolver tries `<family>:latest` if exact tag missing)  
 - `--api auto|generate|chat` endpoint selection (auto tries `/api/generate` then `/api/chat`)  
 - `--llm-mode markdown|full`  
@@ -75,41 +117,37 @@ outputs/tailnet-report_2025-09-30_14-07-12/
 - `--stream` enable streaming (default)  
 - `--stream-chunk-log 2000` streaming progress interval chars (0 disables)  
 - `--debug` log payloads + first 600 chars of model output  
-- Logs and raw LLM output are saved per run; set `--no-log-file` to avoid the `.log`.
+
+---
+
+## Requirements / notes
+
+- `tailscale` must be on PATH (the tool runs `tailscale status --json`).  
+- Ollama is optional (`--no-llm` skips it). With Ollama:  
+  - Make sure the model is pulled, e.g. `ollama pull gemma3:12b`.  
+  - If an exact tag isn’t found, the script tries `<family>:latest`.
+- Outputs are timestamped with **local time** by default; switch to UTC with `--tz utc`.
+- All logs and raw model output are saved in each run folder for debugging.
 
 ---
 
 ## Versioning
 
 - Script defines `__version__`.
-- Tag releases in Git:  
-  ```bash
-  git tag v0.1.0
-  git push --tags
-  ```
+- Tag releases in Git: `git tag v0.1.0 && git push --tags`.
 
 ---
 
-## Notes
+## Why a `pyproject.toml`? (short)
 
-- Requires `tailscale` on PATH.
-- Ollama integration is optional (`--no-llm`). For reliability, prefer `--llm-mode markdown`; `--llm-mode full` is stricter and more brittle.
-- Streaming is enabled by default; tune verbosity with `--stream-chunk-log`.
+It declares project metadata and a console script so you can install and run `homedoc-tailscale-status` as a command via `pipx install .`. You don’t need it to *run* the script, but it makes packaging and CLI usage trivial. (We’re intentionally **not** adding tool configs like Black/Ruff now; you can add them later if/when needed.)
 
 ---
 
-## Contributing
+## License
 
-- Keep the tool single-file and stdlib-only.
-- Prefer small, reviewable PRs.
-- Match the project's logging style and local-time default.
-- For features that add dependencies, discuss first and gate behind flags
-- (human remark from githabideri): I actually don't know what kind of contributions I would even expect, so as always with writing, you can do whatever you want, as long as it is good :)
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for the release checklist.
-
----
-
-```
+GPL-3.0-or-later — see [LICENSE](LICENSE).  
 SPDX-License-Identifier: GPL-3.0-or-later
-```
+
+
+
