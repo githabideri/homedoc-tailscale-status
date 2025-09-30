@@ -1,5 +1,5 @@
 # General Info
-First member of the homedoc scripts that query local computer or network feature, parses its content and produces a small (local) LLM enhanced report; homedoc-tailscale-status queries status of tailscale and writes a time stamped report.
+First member of the homedoc scripts that query local computer or network feature, parses its content and produces a small (local) LLM enhanced report; homedoc-tailscale-status queries status of tailscale and writes a timestamped report.
 
 I am experimenting to find potential use cases for local LLMs as semantic engines that convert the often too technical program outputs into more understandable reports/explanation/documentation for us half or two third literates in the world of technical jargon. Maybe this or similar scripts can be useful to somebody.
 
