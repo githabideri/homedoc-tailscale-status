@@ -25,3 +25,8 @@ build/
 # Project outputs
 outputs/
 *.log
+/homedoc_out/
+/homedoc_out-*/
+
+# misc
+*.zip

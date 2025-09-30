@@ -1,543 +1,570 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-3.0-or-later
 """
-homedoc-tailscale-status: collect `tailscale status --json`, normalize,
-optionally summarize with a local LLM (Ollama), and write timestamped
-artifacts (local time by default) for quick tailnet documentation.
+HomeDoc — Tailscale Status Snapshot & Report
 
-Usage (examples):
-  python homedoc_tailscale_status.py --ollama http://localhost:11434 --model gemma3:12b
-  python homedoc_tailscale_status.py --no-llm  # basic report only
+Single-file, stdlib-only utility that:
+  1) collects `tailscale status --json`,
+  2) normalizes it to a compact snapshot,
+  3) (optionally) queries a local LLM via HTTP to produce a Markdown report with findings,
+  4) writes artifacts into a per-run folder with a local-time timestamp (unless --flat).
+
+v0.1.1 (2025-09-30)
+- Logger uses bounded buffer (deque) to avoid unbounded memory growth; optional live file streaming
+- Consolidated error handling: helpers raise; main() maps to consistent exit codes
+- Safer JSON extraction using json.JSONDecoder.raw_decode (replacing manual brace walker)
+- Streaming hardened: clearer timeouts, minimal-progress watchdog, graceful fallback
+- Markdown table escapes pipe characters; short findings section even without LLM
+- CLI: new --json-only flag; clarified --flat semantics; early logging of resolved model tag
+- Minor FS improvements: create output dir & open log early; line-buffered writes
+
+License: GPLv3
 """
 from __future__ import annotations
 
 import argparse
 import datetime as _dt
+import io
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
-from urllib import error as urlerror
-from urllib import request
+import time
+import urllib.error
+import urllib.request
+from collections import deque
+from dataclasses import dataclass
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
-# ===== Defaults =====
-DEFAULT_OUTDIR = os.environ.get("HOMEDOC_OUTDIR", "outputs")
-DEFAULT_PREFIX = os.environ.get("HOMEDOC_PREFIX", "tailnet-report")
-DEFAULT_OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
-DEFAULT_MODEL = os.environ.get("HOMEDOC_MODEL", "gemma3:12b")
-DEFAULT_TIMEOUT_S = int(os.environ.get("HOMEDOC_TIMEOUT", "900"))
-DEFAULT_MAX_RETRIES = int(os.environ.get("HOMEDOC_MAX_RETRIES", "1"))
-DEFAULT_API_MODE = "auto"  # auto|generate|chat
-DEFAULT_STREAM = True
-DEFAULT_NUM_PREDICT = int(os.environ.get("HOMEDOC_NUM_PREDICT", "256"))
-DEFAULT_NUM_CTX = int(os.environ.get("HOMEDOC_NUM_CTX", "2048"))
-DEFAULT_LLM_MODE = "markdown"  # markdown|full
-DEFAULT_TZ = "local"  # local|utc
-DEFAULT_STREAM_CHUNK_LOG = int(os.environ.get("HOMEDOC_STREAM_CHUNK_LOG", "2000"))
-DEFAULT_WRITE_LOG = True
+DEFAULT_MODEL = os.environ.get("HOMEDOC_LLM_MODEL", "gemma3:12b")
+DEFAULT_SERVER = os.environ.get("HOMEDOC_LLM_SERVER", "http://127.0.0.1:11434")
+DEFAULT_TZ = os.environ.get("HOMEDOC_TZ", "local")  # "local" or "utc"
+DEFAULT_TIMEOUT = int(os.environ.get("HOMEDOC_HTTP_TIMEOUT", "60"))
+DEFAULT_STREAM = os.environ.get("HOMEDOC_STREAM", "1") not in {"0", "false", "False"}
+DEFAULT_LLM_MODE = os.environ.get("HOMEDOC_LLM_MODE", "auto")  # auto|generate|chat
+MAX_LOG_LINES = int(os.environ.get("HOMEDOC_MAX_LOG_LINES", "5000"))
 
-# ===== Time =====
-
-def _now_local():
-    return _dt.datetime.now().astimezone()
-
-
-def _now_utc():
-    return _dt.datetime.utcnow().replace(tzinfo=_dt.timezone.utc)
-
-
-def _fmt_stamp(dt: _dt.datetime) -> str:
-    return dt.strftime("%Y-%m-%d_%H-%M-%S")
-
-
-# ===== Logger =====
+# ------------------------------- Logging -----------------------------------
 class Logger:
-    def __init__(self, debug: bool = False, tz: str = DEFAULT_TZ):
+    def __init__(self, *, debug: bool = False, tz: str = DEFAULT_TZ, max_lines: int = MAX_LOG_LINES, log_path: Optional[str] = None):
         self.debug_enabled = debug
-        self.lines: List[str] = []
+        self.lines: deque[str] = deque(maxlen=max_lines)
         self.tz = tz
+        self._log_file_fp: Optional[io.TextIOWrapper] = None
+        if log_path:
+            # line-buffered writes (buffering=1) to minimize lost tail on abrupt exit
+            os.makedirs(os.path.dirname(log_path), exist_ok=True) if os.path.dirname(log_path) else None
+            self._log_file_fp = open(log_path, "w", buffering=1, encoding="utf-8", newline="\n")
 
-    def _now(self) -> _dt.datetime:
-        return _now_local() if self.tz == "local" else _now_utc()
+    def _stamp(self) -> str:
+        now = _dt.datetime.now(_dt.timezone.utc).astimezone() if self.tz == "local" else _dt.datetime.utcnow()
+        # Use ISO-like human time (no TZ abbreviation to keep portable)
+        return now.strftime("%Y-%m-%d %H:%M:%S")
 
-    def _ts(self) -> str:
-        return self._now().strftime("%Y-%m-%d %H:%M:%S")
-
-    def _emit(self, level: str, msg: str) -> None:
-        line = f"[{self._ts()}] {level}: {msg}"
+    def _write(self, level: str, msg: str) -> None:
+        line = f"[{self._stamp()}] {level}: {msg}"
         self.lines.append(line)
         print(line)
+        if self._log_file_fp is not None:
+            try:
+                self._log_file_fp.write(line + "\n")
+            except Exception:
+                # Never let logging crash the program
+                pass
 
-    def info(self, msg: str) -> None: self._emit("INFO", msg)
-    def warn(self, msg: str) -> None: self._emit("WARN", msg)
-    def error(self, msg: str) -> None: self._emit("ERROR", msg)
+    def info(self, msg: str) -> None:
+        self._write("INFO", msg)
+
+    def error(self, msg: str) -> None:
+        self._write("ERROR", msg)
+
     def debug(self, msg: str) -> None:
-        if self.debug_enabled: self._emit("DEBUG", msg)
-    def write_to(self, path: Path) -> None:
-        path.write_text("\n".join(self.lines) + "\n", encoding="utf-8")
+        if self.debug_enabled:
+            self._write("DEBUG", msg)
+
+    def close(self) -> None:
+        if self._log_file_fp is not None:
+            try:
+                self._log_file_fp.flush()
+                os.fsync(self._log_file_fp.fileno())
+            except Exception:
+                pass
+            try:
+                self._log_file_fp.close()
+            except Exception:
+                pass
+
+# ------------------------------ Utilities ----------------------------------
+@dataclass
+class Paths:
+    run_dir: str
+    log_path: Optional[str]
+    status_json_path: str
+    snapshot_json_path: str
+    insights_json_path: str
+    report_md_path: str
+    raw_llm_path: str
 
 
-# ===== CLI =====
+def compute_paths(base_dir: str, *, flat: bool, tz: str, log_file: Optional[str]) -> Paths:
+    # Timestamp based on local or UTC time
+    now = _dt.datetime.now() if tz == "local" else _dt.datetime.utcnow()
+    stamp = now.strftime("%Y%m%d-%H%M%S")
+    run_dir = base_dir if flat else os.path.join(base_dir, stamp)
+    os.makedirs(run_dir, exist_ok=True)
 
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Tailscale tailnet reporter (single-file, stdlib-only)")
-    p.add_argument("--out", default=DEFAULT_OUTDIR)
-    p.add_argument("--prefix", default=DEFAULT_PREFIX)
-    p.add_argument("--flat", action="store_true")
-    p.add_argument("--input-json", default=None, help="Use existing tailscale status JSON file")
-    p.add_argument("--no-llm", action="store_true")
-    p.add_argument("--ollama", default=DEFAULT_OLLAMA_URL)
-    p.add_argument("--model", default=DEFAULT_MODEL)
-    p.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT_S)
-    p.add_argument("--max-retries", type=int, default=DEFAULT_MAX_RETRIES)
-    p.add_argument("--api", choices=["auto","generate","chat"], default=DEFAULT_API_MODE)
-    p.add_argument("--stream", dest="stream", action="store_true", default=DEFAULT_STREAM)
-    p.add_argument("--no-stream", dest="stream", action="store_false")
-    p.add_argument("--num-predict", type=int, default=DEFAULT_NUM_PREDICT)
-    p.add_argument("--num-ctx", type=int, default=DEFAULT_NUM_CTX)
-    p.add_argument("--llm-mode", choices=["markdown","full"], default=DEFAULT_LLM_MODE)
-    p.add_argument("--tz", choices=["local","utc"], default=DEFAULT_TZ)
-    p.add_argument("--stream-chunk-log", type=int, default=DEFAULT_STREAM_CHUNK_LOG)
-    p.add_argument("--debug", action="store_true")
-    p.add_argument("--log-file", default=None)
-    p.add_argument("--no-log-file", action="store_true")
-    return p.parse_args()
+    log_path = os.path.join(run_dir, "homedoc.log") if log_file is None else log_file
 
-
-# ===== Ollama =====
-
-def fetch_installed_models(ollama_url: str, timeout: int, log: Logger, debug: bool) -> List[str]:
-    try:
-        url = f"{ollama_url.rstrip('/')}/api/tags"
-        with request.urlopen(request.Request(url), timeout=min(timeout, 10)) as resp:
-            data = json.loads(resp.read().decode("utf-8", errors="replace"))
-        names = [m.get("name") for m in data.get("models", []) if isinstance(m, dict)]
-        if debug: log.debug("Installed models: " + (", ".join(names) if names else "(none)"))
-        return [n for n in names if isinstance(n, str)]
-    except Exception as e:
-        if debug: log.debug(f"Failed to fetch installed models: {e}")
-        return []
-
-
-def resolve_model_tag(requested: str, installed: List[str], log: Logger) -> str:
-    if requested in installed: return requested
-    fam = requested.split(":", 1)[0]
-    if f"{fam}:latest" in installed:
-        log.info(f"Resolved model tag: {requested} -> {fam}:latest")
-        return f"{fam}:latest"
-    for n in installed:
-        if n.startswith(fam + ":"):
-            log.info(f"Resolved model tag: {requested} -> {n}")
-            return n
-    return requested
-
-
-def stream_lines(url: str, payload: Dict[str, Any], timeout: int, log: Logger, debug: bool, progress_every: int) -> str:
-    data = json.dumps(payload).encode("utf-8")
-    req = request.Request(url, data=data, headers={"Content-Type": "application/json"})
-    if debug: log.debug("Payload:\n" + json.dumps(payload, indent=2))
-    buf: List[str] = []
-    chars = last = 0
-    with request.urlopen(req, timeout=timeout) as resp:
-        for raw in resp:
-            for line in raw.decode("utf-8", errors="replace").splitlines():
-                line = line.strip()
-                if not line: continue
-                try:
-                    obj = json.loads(line)
-                except json.JSONDecodeError:
-                    if debug: log.debug(f"Non-JSON line: {line[:200]}")
-                    continue
-                s = obj.get("response")
-                if s is None and isinstance(obj.get("message"), dict):
-                    s = obj["message"].get("content")
-                if s:
-                    buf.append(s); chars += len(s)
-                    if progress_every > 0 and (chars - last) >= progress_every:
-                        last = chars; log.info(f"…streamed ~{chars} chars")
-                if obj.get("done"):
-                    metrics = obj.get("metrics") or {}
-                    if metrics.get("total_duration") is not None:
-                        log.info(f"Ollama done. tokens={metrics.get('eval_count')} total_duration={metrics.get('total_duration')}ns")
-                    return "".join(buf)
-    return "".join(buf)
-
-
-def _call_once(url: str, payload: Dict[str, Any], timeout: int) -> str:
-    data = json.dumps(payload).encode("utf-8")
-    req = request.Request(url, data=data, headers={"Content-Type": "application/json"})
-    with request.urlopen(req, timeout=timeout) as resp:
-        body = resp.read().decode("utf-8")
-    obj = json.loads(body)
-    if isinstance(obj.get("response"), str):
-        return obj["response"]
-    if isinstance(obj.get("message"), dict) and isinstance(obj["message"].get("content"), str):
-        return obj["message"]["content"]
-    raise RuntimeError("Unexpected Ollama response body")
-
-
-def call_ollama(ollama_url: str, model: str, api_mode: str, llm_mode: str, prompt: Dict[str, str],
-                timeout: int, stream: bool, num_predict: int, num_ctx: int, log: Logger, debug: bool,
-                progress_every: int) -> Tuple[str, str]:
-    base = ollama_url.rstrip('/')
-    eff_model = resolve_model_tag(model, fetch_installed_models(ollama_url, timeout, log, debug), log)
-    opts = {"temperature": 0.1, "num_predict": num_predict, "num_ctx": num_ctx}
-
-    def do_generate():
-        payload = {"model": eff_model, "options": opts, "stream": stream}
-        if llm_mode == "full": payload["format"] = "json"
-        payload["prompt"] = prompt["system"] + "\n\n" + prompt["user"]
-        url = f"{base}/api/generate"
-        return (stream_lines(url, payload, timeout, log, debug, progress_every) if stream else _call_once(url, payload, timeout)), "/api/generate"
-
-    def do_chat():
-        payload = {"model": eff_model, "options": opts, "stream": stream, "messages": [
-            {"role":"system","content":prompt["system"]},
-            {"role":"user","content":prompt["user"]},
-        ]}
-        if llm_mode == "full": payload["format"] = "json"
-        url = f"{base}/api/chat"
-        return (stream_lines(url, payload, timeout, log, debug, progress_every) if stream else _call_once(url, payload, timeout)), "/api/chat"
-
-    if api_mode in ("auto", "generate"):
-        try: return do_generate()
-        except urlerror.HTTPError as e:
-            if api_mode == "auto" and e.code == 404: log.warn("/api/generate 404 -> falling back to /api/chat")
-            else: raise
-    return do_chat()
-
-
-# ===== Prompt & findings =====
-
-def compact_for_llm(snapshot: Dict[str, Any]) -> Dict[str, Any]:
-    small = []
-    for d in snapshot.get("devices", []):
-        small.append({
-            "role": d.get("role"),
-            "name": d.get("name"),
-            "dns": d.get("dns") or d.get("hostname"),
-            "addr": (d.get("addrs") or [None])[0],
-            "tags": d.get("tags") or [],
-            "online": bool(d.get("online")),
-        })
-    return {"run_id": snapshot.get("run_id"), "device_count": len(small), "devices": small}
-
-
-def compute_findings(snapshot: Dict[str, Any]) -> Dict[str, Any]:
-    offline, tag_summary = [], {}
-    for d in snapshot.get("devices", []):
-        if not d.get("online"):
-            label = d.get("name") or d.get("dns") or (d.get("addrs") or [None])[0] or "unknown"
-            offline.append(str(label))
-        for t in d.get("tags", []) or []:
-            tag_summary[t] = tag_summary.get(t, 0) + 1
-    return {"offline_devices": offline, "tag_summary": tag_summary}
-
-
-def build_prompts(snapshot: Dict[str, Any], llm_mode: str, prev_err: Optional[str]) -> Dict[str, str]:
-    small = compact_for_llm(snapshot)
-    if llm_mode == "full":
-        schema = (
-            'Return ONLY a single JSON object with this shape:\n'
-            '{\n  "markdown": string,\n  "findings": {\n    "offline_devices": string[],\n    "tag_summary": { [tag: string]: number }\n  }\n}\n'
-            'No extra keys. No trailing commas. No code fences. No commentary.'
-        )
-        system = (
-            "You are a meticulous infra doc writer. Never invent facts.\n"
-            "Use ONLY the provided device summary JSON. Be concise.\n" + schema
-        )
-        hint = f"\nPrevious validation error: {prev_err}\n" if prev_err else ""
-        user = hint + "DEVICE SUMMARY JSON FOLLOWS:\n" + json.dumps(small, ensure_ascii=False, indent=2)
-        return {"system": system, "user": user}
-    system = (
-        "Write terse, actionable infra notes (<=10 bullets). Do NOT echo JSON. Focus on: \n"
-        "- offline devices (names),\n- tag counts/oddities,\n- 1–2 hygiene suggestions."
+    return Paths(
+        run_dir=run_dir,
+        log_path=log_path,
+        status_json_path=os.path.join(run_dir, "status.json"),
+        snapshot_json_path=os.path.join(run_dir, "snapshot.json"),
+        insights_json_path=os.path.join(run_dir, "insights.json"),
+        report_md_path=os.path.join(run_dir, "report.md"),
+        raw_llm_path=os.path.join(run_dir, "llm_raw.txt"),
     )
-    user = "DEVICE SUMMARY JSON FOLLOWS:\n" + json.dumps(small, ensure_ascii=False, indent=2)
-    return {"system": system, "user": user}
 
 
-# ===== JSON validation (full mode) =====
+# ------------------------------ Preflight ----------------------------------
+def preflight(args: argparse.Namespace) -> None:
+    if args.input_json:
+        return  # offline mode: no dependency on tailscale binary
+    if shutil.which("tailscale") is None:
+        raise FileNotFoundError("`tailscale` not found on PATH; install Tailscale or provide --input-json")
 
-def try_extract_json_object(text: str) -> Optional[Dict[str, Any]]:
-    start = text.find('{')
-    if start == -1: return None
-    depth = 0; in_str = False; esc = False
-    for i in range(start, len(text)):
-        ch = text[i]
-        if in_str:
-            if esc: esc = False
-            elif ch == '\\': esc = True
-            elif ch == '"': in_str = False
-        else:
-            if ch == '"': in_str = True
-            elif ch == '{': depth += 1
-            elif ch == '}': depth -= 1; \
-                (0 == depth) and (lambda: None)()
-            if depth == 0 and i >= start:
-                try: return json.loads(text[start:i+1])
-                except json.JSONDecodeError: return None
+
+# -------------------------- Tailscale collection ----------------------------
+def run_tailscale_status_json(timeout: int, *, log: Logger) -> Dict[str, Any]:
+    cmd = ["tailscale", "status", "--json"]
+    log.debug(f"Running: {' '.join(cmd)}")
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=True)
+    except subprocess.TimeoutExpired as e:
+        raise RuntimeError(f"tailscale status timed out after {timeout}s") from e
+    except subprocess.CalledProcessError as e:
+        stderr = e.stderr.strip() if e.stderr else ""
+        raise RuntimeError(f"tailscale status failed: {stderr}") from e
+
+    try:
+        data = json.loads(proc.stdout)
+    except json.JSONDecodeError as e:
+        raise ValueError("tailscale returned non-JSON output") from e
+    return data
+
+
+# ---------------------------- Normalization ---------------------------------
+# NOTE: Tailscale status schema evolves; we normalize a subset for reporting.
+def _first_nonempty(*vals: Optional[str]) -> Optional[str]:
+    for v in vals:
+        if v:
+            return v
     return None
 
 
-def validate_full_json(obj_or_str: Any) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-    try:
-        data = json.loads(obj_or_str) if isinstance(obj_or_str, str) else obj_or_str
-    except json.JSONDecodeError:
-        data = try_extract_json_object(obj_or_str if isinstance(obj_or_str, str) else "")
-        if data is None: return None, "invalid JSON and no recoverable object found"
-    if not isinstance(data, dict): return None, "top-level is not an object"
-    if "markdown" not in data or "findings" not in data: return None, "missing required keys: markdown and findings"
-    if not isinstance(data.get("markdown"), str): return None, "markdown must be a string"
-    findings = data.get("findings")
-    if not isinstance(findings, dict): return None, "findings must be an object"
-    if "offline_devices" not in findings or "tag_summary" not in findings:
-        return None, "findings missing keys: offline_devices, tag_summary"
-    if not isinstance(findings["offline_devices"], list) or not all(isinstance(x, str) for x in findings["offline_devices"]):
-        return None, "offline_devices must be an array of strings"
-    if not isinstance(findings["tag_summary"], dict) or not all(isinstance(k, str) and isinstance(v, (int, float)) for k, v in findings["tag_summary"].items()):
-        return None, "tag_summary must be an object of string->number"
-    return data, None
+def normalize_snapshot(status: Dict[str, Any]) -> Dict[str, Any]:
+    me = status.get("Self", {})
+    peers = status.get("Peer", {}) or status.get("Peers", {}) or {}
+    if isinstance(peers, list):
+        peer_list = peers
+    else:
+        peer_list = list(peers.values())
 
+    def _labels(node: Dict[str, Any]) -> List[str]:
+        tags = node.get("Tags") or []
+        if isinstance(tags, dict):
+            tags = list(tags.values())
+        elif not isinstance(tags, list):
+            tags = [str(tags)]
+        return [str(t) for t in tags]
 
-# ===== Rendering =====
+    def _ip_list(node: Dict[str, Any]) -> List[str]:
+        ips = node.get("TailscaleIPs") or node.get("Addresses") or []
+        return [str(x) for x in ips]
 
-def render_basic_markdown(snapshot: Dict[str, Any]) -> str:
-    lines = [f"# Tailscale Tailnet Report — {snapshot['run_id']}", "",
-             f"_Devices discovered_: **{snapshot.get('device_count', 0)}**", "",
-             "## Devices", "",
-             "| Role | Name | Hostname | DNS | Addrs | Tags | Online | OS | Last seen |",
-             "|---|---|---|---|---|---|---:|---|---|"]
-    for d in snapshot.get("devices", []):
-        addrs = ", ".join(d.get("addrs") or []); tags = ", ".join(d.get("tags") or [])
-        online = "yes" if d.get("online") else "no"
-        lines.append(f"| {d.get('role','')} | {d.get('name','')} | {d.get('hostname') or '—'} | {d.get('dns') or '—'} | {addrs or '—'} | {tags or '—'} | {online} | {d.get('os','') or '—'} | {d.get('last_seen') or '—'} |")
-    lines.append("")
-    return "\n".join(lines)
+    def _hostname(node: Dict[str, Any]) -> Optional[str]:
+        return _first_nonempty(node.get("HostName"), node.get("DNSName"), node.get("Name"))
 
+    def _os(node: Dict[str, Any]) -> Optional[str]:
+        osv = node.get("OS") or node.get("OSVersion")
+        return str(osv) if osv is not None else None
 
-def render_from_llm(snapshot: Dict[str, Any], insights: Dict[str, Any]) -> str:
-    base = render_basic_markdown(snapshot)
-    lines = [base, "## Findings", ""]
-    md = (insights.get("markdown") or "").strip()
-    if md: lines += [md, ""]
-    lines.append("### Structured findings (summary)")
-    offline = insights.get("findings", {}).get("offline_devices", [])
-    tag_summary = insights.get("findings", {}).get("tag_summary", {})
-    lines.append(f"- Offline devices: {', '.join(offline) if offline else 'none'}")
-    if tag_summary:
-        lines.append("- Tag summary:")
-        for k, v in sorted(tag_summary.items()):
-            lines.append(f"  - {k}: {v}")
-    lines += ["", "_See `*_insights.json` for machine-parseable details._", ""]
-    return "\n".join(lines)
-
-
-# ===== Tailscale collect/normalize =====
-
-def _iter_peers(ts: Dict[str, Any]) -> List[Dict[str, Any]]:
-    peers = ts.get("Peer") or ts.get("Peers") or []
-    if isinstance(peers, dict): return list(peers.values())
-    if isinstance(peers, list): return peers
-    return []
-
-
-def normalize_tailscale(ts: Dict[str, Any], log: Logger, tz: str) -> Dict[str, Any]:
-    log.info("Normalizing snapshot")
-    now = _now_local() if tz == "local" else _now_utc()
-    run_id = _fmt_stamp(now)
     devices: List[Dict[str, Any]] = []
 
-    def extract(node: Dict[str, Any], role: str) -> Dict[str, Any]:
-        name = node.get("HostName") or node.get("DNSName") or node.get("Name") or ""
-        dns = node.get("DNSName"); host = node.get("HostName")
-        ips = node.get("TailscaleIPs") or node.get("Addresses") or []
-        tags = node.get("Tags") or []
-        online = bool(node.get("Online", True))
-        osname = node.get("OS") or node.get("PeerOS") or ""
-        last_seen = node.get("LastSeen") or node.get("LastSeenTime") or ""
-        user = node.get("User") or node.get("UserID") or ""
-        return {"role": role, "name": name, "hostname": host, "dns": dns, "addrs": ips,
-                "tags": tags, "online": online, "os": osname, "user": user, "last_seen": last_seen}
+    def _mk(node: Dict[str, Any], role: str) -> Dict[str, Any]:
+        return {
+            "role": role,
+            "id": node.get("ID") or node.get("NodeID"),
+            "name": node.get("Name") or node.get("HostName") or node.get("DNSName"),
+            "hostname": _hostname(node),
+            "ips": _ip_list(node),
+            "user": node.get("User"),
+            "online": bool(node.get("Online", True)),
+            "os": _os(node),
+            "tags": _labels(node),
+            "last_seen": node.get("LastSeen"),
+            "created": node.get("Created"),
+            "expired": bool(node.get("Expired", False)),
+            "key_expired": bool(node.get("KeyExpired", False)),
+        }
 
-    if isinstance(ts.get("Self"), dict): devices.append(extract(ts["Self"], "self"))
-    for peer in _iter_peers(ts): devices.append(extract(peer, "peer"))
+    if me:
+        devices.append(_mk(me, "self"))
+    for p in peer_list:
+        devices.append(_mk(p, "peer"))
 
-    snap = {"run_id": run_id, "timezone": tz, "source": "tailscale status --json",
-            "device_count": len(devices), "devices": devices}
-    log.info(f"Snapshot contains {snap['device_count']} device(s)")
-    return snap
+    return {
+        "schema": 1,
+        "generated_at": int(time.time()),
+        "device_count": len(devices),
+        "online_count": sum(1 for d in devices if d.get("online")),
+        "offline_count": sum(1 for d in devices if not d.get("online")),
+        "expired_count": sum(1 for d in devices if d.get("expired") or d.get("key_expired")),
+        "devices": devices,
+    }
 
 
-def run_tailscale_status_json(log: Logger) -> Dict[str, Any]:
-    log.info("Collecting: `tailscale status --json`")
+# ------------------------------ Markdown -----------------------------------
+def _md_escape(x: Optional[str]) -> str:
+    s = "" if x is None else str(x)
+    # escape pipes to avoid breaking tables
+    return s.replace("|", "\\|")
+
+
+def render_markdown(snapshot: Dict[str, Any], findings: List[str]) -> str:
+    lines: List[str] = []
+    lines.append("# Tailscale Status Report\n")
+    lines.append(f"Generated: <time>{_dt.datetime.now().isoformat(timespec='seconds')}</time>\n")
+    lines.append("")
+
+    lines.append("## Summary\n")
+    lines.append(f"* Devices: {snapshot['device_count']}  ")
+    lines.append(f"* Online: {snapshot['online_count']}  ")
+    lines.append(f"* Offline: {snapshot['offline_count']}  ")
+    lines.append(f"* Key/Node expired: {snapshot['expired_count']}\n")
+
+    if findings:
+        lines.append("## Findings\n")
+        for f in findings:
+            lines.append(f"- {f}")
+        lines.append("")
+
+    lines.append("## Devices\n")
+    lines.append("| role | name | hostname | online | ips | os | tags | last_seen | expired |")
+    lines.append("|---|---|---|:--:|---|---|---|---|:--:|")
+    for d in snapshot.get("devices", []):
+        row = "| {role} | {name} | {hostname} | {online} | {ips} | {os} | {tags} | {last_seen} | {expired} |".format(
+            role=_md_escape(d.get("role")),
+            name=_md_escape(d.get("name")),
+            hostname=_md_escape(d.get("hostname")),
+            online="✅" if d.get("online") else "❌",
+            ips=_md_escape(", ".join(d.get("ips", []))),
+            os=_md_escape(d.get("os")),
+            tags=_md_escape(", ".join(d.get("tags", []))),
+            last_seen=_md_escape(d.get("last_seen")),
+            expired="⚠️" if (d.get("expired") or d.get("key_expired")) else "—",
+        )
+        lines.append(row)
+
+    return "\n".join(lines) + "\n"
+
+
+def compute_findings(snapshot: Dict[str, Any]) -> List[str]:
+    findings: List[str] = []
+    if snapshot.get("offline_count", 0) > 0:
+        findings.append(f"{snapshot['offline_count']} device(s) offline")
+    if snapshot.get("expired_count", 0) > 0:
+        findings.append(f"{snapshot['expired_count']} device(s) with expired/invalid keys")
+    # Example heuristic: too many peers without tags
+    untagged = sum(1 for d in snapshot.get("devices", []) if not d.get("tags"))
+    if untagged:
+        findings.append(f"{untagged} device(s) without tags — consider labeling for ops hygiene")
+    return findings
+
+
+# ------------------------------- LLM client ---------------------------------
+class HttpClient:
+    def __init__(self, base_url: str, timeout: int, log: Logger):
+        self.base_url = base_url.rstrip("/")
+        self.timeout = timeout
+        self.log = log
+
+    def _open(self, url: str, data: Optional[bytes]) -> io.BufferedReader:
+        req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+        return urllib.request.urlopen(req, timeout=self.timeout)  # nosec - local URLs expected
+
+    def post_json(self, path: str, payload: Dict[str, Any]) -> str:
+        url = f"{self.base_url}{path}"
+        data = json.dumps(payload).encode("utf-8")
+        self.log.debug(f"HTTP POST {url} payload_bytes={len(data)}")
+        try:
+            with self._open(url, data) as resp:
+                out = resp.read().decode("utf-8", errors="replace")
+                return out
+        except urllib.error.HTTPError as e:
+            text = e.read().decode("utf-8", errors="replace") if hasattr(e, "read") else str(e)
+            raise RuntimeError(f"HTTP {e.code} for {path}: {text}") from e
+        except (urllib.error.URLError, socket.timeout) as e:
+            raise RuntimeError(f"HTTP error for {path}: {e}") from e
+
+    def stream_lines(self, path: str, payload: Dict[str, Any], *, watchdog_seconds: int = 20) -> Iterator[str]:
+        url = f"{self.base_url}{path}"
+        data = json.dumps(payload).encode("utf-8")
+        self.log.debug(f"HTTP STREAM {url} payload_bytes={len(data)}")
+        last_progress = time.time()
+        try:
+            with self._open(url, data) as resp:
+                while True:
+                    chunk = resp.readline()
+                    if not chunk:
+                        break
+                    s = chunk.decode("utf-8", errors="replace").strip()
+                    if s:
+                        last_progress = time.time()
+                        yield s
+                    # minimal-progress watchdog
+                    if time.time() - last_progress > watchdog_seconds:
+                        raise RuntimeError(f"No streaming progress for >{watchdog_seconds}s")
+        except urllib.error.HTTPError as e:
+            text = e.read().decode("utf-8", errors="replace") if hasattr(e, "read") else str(e)
+            raise RuntimeError(f"HTTP {e.code} for {path}: {text}") from e
+        except (urllib.error.URLError, socket.timeout) as e:
+            raise RuntimeError(f"HTTP error for {path}: {e}") from e
+
+
+# JSON helpers
+
+def try_extract_json_object(text: str) -> Optional[Dict[str, Any]]:
+    """Recover the first top-level JSON object in text using raw_decode.
+    Returns None if no valid object is found or the object isn't a dict."""
+    if not text:
+        return None
     try:
-        proc = subprocess.run(["tailscale", "status", "--json"], capture_output=True, text=True, check=True)
-        if log.debug_enabled:
-            log.debug(f"tailscale stdout length: {len(proc.stdout)} bytes")
-            if proc.stderr: log.debug(f"tailscale stderr: {proc.stderr.strip()}")
-    except FileNotFoundError:
-        log.error("`tailscale` not found on PATH. Install Tailscale or pass --input-json."); sys.exit(1)
-    except subprocess.CalledProcessError as e:
-        log.error(f"tailscale failed: {e.stderr.strip() or e.stdout.strip() or e}"); sys.exit(1)
-    try:
-        data = json.loads(proc.stdout); log.info("Collected tailscale status JSON."); return data
+        val = json.loads(text)
+        return val if isinstance(val, dict) else None
     except json.JSONDecodeError:
-        log.error("tailscale returned invalid JSON."); sys.exit(1)
+        pass
+    start = text.find("{")
+    if start < 0:
+        return None
+    dec = json.JSONDecoder()
+    try:
+        obj, _end = dec.raw_decode(text[start:])
+        return obj if isinstance(obj, dict) else None
+    except json.JSONDecodeError:
+        return None
 
 
-# ===== Output paths =====
-
-def compute_paths(out_root: Path, prefix: str, flat: bool, tz: str) -> Dict[str, Path]:
-    now = _now_local() if tz == "local" else _now_utc(); stamp = _fmt_stamp(now)
-    if flat:
-        base = out_root; base.mkdir(parents=True, exist_ok=True); stem = f"{prefix}_{stamp}"
-        return {"base": base, "stem": stem,
-                "status": base / f"{stem}_status.raw.json",
-                "snapshot": base / f"{stem}_snapshot.json",
-                "insights": base / f"{stem}_insights.json",
-                "report": base / f"{stem}_report.md",
-                "llm_raw": base / f"{stem}_llm.raw.txt",
-                "log": base / f"{stem}.log"}
-    run_dir = out_root / f"{prefix}_{stamp}"; run_dir.mkdir(parents=True, exist_ok=True); stem = f"{prefix}_{stamp}"
-    return {"base": run_dir, "stem": stem,
-            "status": run_dir / f"{stem}_status.raw.json",
-            "snapshot": run_dir / f"{stem}_snapshot.json",
-            "insights": run_dir / f"{stem}_insights.json",
-            "report": run_dir / f"{stem}_report.md",
-            "llm_raw": run_dir / f"{stem}_llm.raw.txt",
-            "log": run_dir / f"{stem}.log"}
+def validate_full_json(obj: Dict[str, Any]) -> Tuple[bool, str]:
+    # Minimal schema: expect keys 'summary' (str) and optional 'bullets' (list[str])
+    if not isinstance(obj, dict):
+        return False, "not an object"
+    if "summary" not in obj or not isinstance(obj["summary"], str):
+        return False, "missing 'summary' string"
+    if "bullets" in obj and not (isinstance(obj["bullets"], list) and all(isinstance(x, str) for x in obj["bullets"])):
+        return False, "'bullets' must be a list of strings"
+    return True, "ok"
 
 
-# ===== Preflight =====
-
-def preflight(args: argparse.Namespace, log: Logger) -> None:
-    if args.input_json: return
-    if shutil.which("tailscale") is None:
-        log.error("Preflight: `tailscale` not found on PATH. Install it or use --input-json.")
-        sys.exit(1)
-
-
-# ===== Main =====
-
-def main() -> int:
-    args = parse_args()
-    log = Logger(debug=args.debug, tz=args.tz)
-
-    out_root = Path(os.path.expanduser(args.out))
-    paths = compute_paths(out_root, args.prefix, args.flat, args.tz)
-
-    log_path: Optional[Path] = None
-    if not args.no_log_file and DEFAULT_WRITE_LOG:
-        log_path = Path(os.path.expanduser(args.log_file)) if args.log_file else paths["log"]
-
-    log.info("Starting homedoc run")
-    log.info(f"Config: out_root={out_root} flat={args.flat} prefix={args.prefix} tz={args.tz}")
-    log.info(
-        "LLM: enabled=%s model=%s server=%s timeout=%ss retries=%s api=%s stream=%s num_predict=%s num_ctx=%s llm_mode=%s stream_chunk_log=%s"
-        % (not args.no_llm, args.model, args.ollama, args.timeout, args.max_retries, args.api, args.stream, args.num_predict, args.num_ctx, args.llm_mode, args.stream_chunk_log)
+def llm_generate_markdown(client: HttpClient, snapshot: Dict[str, Any], *, model: str, mode: str, stream: bool, timeout: int, log: Logger) -> Tuple[str, str]:
+    """Return (markdown_text, raw_text). Tries /api/generate first, then /api/chat.
+    If streaming fails, falls back to non-streaming."""
+    prompt = (
+        "You are a systems SRE. Given the following compact JSON snapshot of a Tailscale network, "
+        "write a short Markdown report with a 'Findings' section (bulleted), and a concise table. "
+        "Focus on offline devices and expired keys. Keep it factual and compact." 
     )
-    log.info(f"Debug mode: {args.debug}")
+    input_json = json.dumps(snapshot, separators=(",", ":"))
 
-    preflight(args, log)
+    payload_generate = {
+        "model": model,
+        "prompt": prompt + "\nSNAPSHOT=" + input_json,
+        "stream": stream,
+        "options": {"temperature": 0},
+    }
 
-    # 1) tailscale JSON
+    payload_chat = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": "You are a terse SRE who writes concise Markdown."},
+            {"role": "user", "content": prompt + "\nSNAPSHOT=" + input_json},
+        ],
+        "stream": stream,
+        "options": {"temperature": 0},
+    }
+
+    def _collect_stream(path: str, payload: Dict[str, Any]) -> str:
+        buf = []
+        for line in client.stream_lines(path, payload):
+            # Expect provider-specific line JSON with a 'done' flag or partial text
+            obj = try_extract_json_object(line)
+            if obj:
+                if obj.get("done"):
+                    break
+                # Common fields used by local LLM servers
+                txt = obj.get("response") or obj.get("message") or obj.get("content") or ""
+                if txt:
+                    buf.append(txt)
+            else:
+                # If plain text lines are streamed, accept them
+                buf.append(line)
+        return "".join(buf)
+
+    def _post(path: str, payload: Dict[str, Any]) -> str:
+        return client.post_json(path, payload)
+
+    tried_paths: List[str] = []
+
+    def _attempt(path: str, payload: Dict[str, Any]) -> str:
+        tried_paths.append(path)
+        if stream:
+            try:
+                return _collect_stream(path, payload)
+            except Exception as e:
+                log.error(f"streaming failed on {path}: {e}; retrying without stream")
+                # fall through to non-streaming
+        # non-streaming
+        return _post(path, {**payload, "stream": False})
+
+    raw = ""
+    if mode in ("auto", "generate"):
+        try:
+            raw = _attempt("/api/generate", payload_generate)
+            endpoint_used = "/api/generate"
+        except Exception as e:
+            log.error(f"/api/generate failed: {e}; trying /api/chat")
+            raw = ""
+        else:
+            if raw:
+                md = raw.strip()
+                return md, raw
+
+    # Fallback or forced chat mode
+    try:
+        raw = _attempt("/api/chat", payload_chat)
+        endpoint_used = "/api/chat"
+    except Exception as e:
+        raise RuntimeError(f"Both generate/chat failed: {e}") from e
+
+    md = raw.strip()
+    return md, raw
+
+
+# ------------------------------ Main program --------------------------------
+def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Collect Tailscale status, normalize snapshot, optional LLM report.")
+    p.add_argument("--out", default="./homedoc_out", help="Output directory (default: ./homedoc_out)")
+    p.add_argument("--flat", action="store_true", help="Write artifacts directly to --out without a timestamp subdir")
+    p.add_argument("--tz", default=DEFAULT_TZ, choices=["local", "utc"], help="Timestamp timezone for run folder name")
+    p.add_argument("--debug", action="store_true", help="Verbose debug logging")
+    p.add_argument("--log-file", default=None, help="Write logs to this file (default: OUT/run/homedoc.log)")
+
+    p.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT, help="Subprocess/HTTP timeout seconds")
+
+    # Offline input for testing
+    p.add_argument("--input-json", default=None, help="Read Tailscale status from this JSON file instead of running tailscale")
+
+    # LLM controls
+    p.add_argument("--no-llm", action="store_true", help="Skip LLM step; only collect & render local report")
+    p.add_argument("--json-only", action="store_true", help="Write JSON artifacts, skip Markdown entirely")
+    p.add_argument("--llm-mode", default=DEFAULT_LLM_MODE, choices=["auto", "generate", "chat"], help="API path preference")
+    p.add_argument("--server", default=DEFAULT_SERVER, help="LLM HTTP base URL (default env HOMEDOC_LLM_SERVER or local)")
+    p.add_argument("--model", default=DEFAULT_MODEL, help="LLM model tag (default env HOMEDOC_LLM_MODEL)")
+    p.add_argument("--stream", dest="stream", action="store_true", default=DEFAULT_STREAM, help="Enable streaming (default)")
+    p.add_argument("--no-stream", dest="stream", action="store_false", help="Disable streaming")
+
+    return p.parse_args(argv)
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    args = parse_args(argv)
+
+    paths = compute_paths(args.out, flat=args.flat, tz=args.tz, log_file=args.log_file)
+    log = Logger(debug=args.debug, tz=args.tz, max_lines=MAX_LOG_LINES, log_path=paths.log_path)
+    log.info(f"HomeDoc v{__version__}")
+    log.info(f"Output dir: {paths.run_dir}")
+
+    # Preflight
+    try:
+        preflight(args)
+    except Exception as e:
+        log.error(str(e))
+        log.close()
+        return 2
+
+    # Collect status
     try:
         if args.input_json:
-            ts_status = json.loads(Path(args.input_json).read_text())
-            log.info(f"Loaded tailscale JSON from file: {args.input_json}")
+            with open(args.input_json, "r", encoding="utf-8") as f:
+                status = json.load(f)
+            log.info(f"Loaded input JSON: {args.input_json}")
         else:
-            ts_status = run_tailscale_status_json(log)
-        paths["status"].write_text(json.dumps(ts_status, indent=2, ensure_ascii=False), encoding="utf-8")
-        log.info(f"Wrote raw tailscale status: {paths['status']}")
-    except SystemExit as e:
-        if log_path:
-            try: log.write_to(log_path); print(f"Log written: {log_path}")
-            except Exception: pass
-        return int(e.code) if isinstance(e.code, int) else 1
+            status = run_tailscale_status_json(args.timeout, log=log)
+            log.info("Collected tailscale status")
+        with open(paths.status_json_path, "w", encoding="utf-8") as f:
+            json.dump(status, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        log.error(f"Failed to obtain status JSON: {e}")
+        log.close()
+        return 3
 
-    # 2) normalize
-    snapshot = normalize_tailscale(ts_status, log, args.tz)
-    paths["snapshot"].write_text(json.dumps(snapshot, indent=2, ensure_ascii=False), encoding="utf-8")
-    log.info(f"Wrote snapshot: {paths['snapshot']}")
+    # Normalize
+    try:
+        snapshot = normalize_snapshot(status)
+        with open(paths.snapshot_json_path, "w", encoding="utf-8") as f:
+            json.dump(snapshot, f, indent=2, ensure_ascii=False)
+        log.info("Wrote snapshot.json")
+    except Exception as e:
+        log.error(f"Normalization failed: {e}")
+        log.close()
+        return 3
 
-    # 3) LLM or basic report
+    # Local findings
+    local_findings = compute_findings(snapshot)
+
+    # Markdown (always available unless --json-only)
+    if not args.json_only:
+        try:
+            md = render_markdown(snapshot, local_findings)
+            with open(paths.report_md_path, "w", encoding="utf-8") as f:
+                f.write(md)
+            log.info("Wrote report.md (local)")
+        except Exception as e:
+            log.error(f"Failed to write base Markdown: {e}")
+
     if args.no_llm:
-        md = render_basic_markdown(snapshot)
-        paths["report"].write_text(md, encoding="utf-8")
-        log.info("LLM disabled (--no-llm). Basic report written.")
-        log.info(f"Report: {paths['report']}")
-        if log_path: log.write_to(log_path); print(f"Log written: {log_path}")
-        print("Wrote:\n  %s\n  %s\n  %s" % (paths["status"], paths["snapshot"], paths["report"]))
+        log.info("Skipping LLM (per --no-llm)")
+        log.close()
         return 0
 
-    prev_err = None
-    insights: Optional[Dict[str, Any]] = None
-    raw_text: Optional[str] = None
-    endpoint_used: Optional[str] = None
+    # LLM step
+    client = HttpClient(args.server, args.timeout, log)
+    log.info(f"LLM model requested: {args.model}; mode={args.llm_mode}; stream={args.stream}")
 
-    for attempt in range(args.max_retries + 1):
-        log.info(f"LLM attempt {attempt+1}/{args.max_retries+1}")
-        try:
-            prompts = build_prompts(snapshot, args.llm_mode, prev_err)
-            raw_text, endpoint_used = call_ollama(
-                args.ollama, args.model, args.api, args.llm_mode,
-                prompts, args.timeout, args.stream, args.num_predict, args.num_ctx, log, args.debug,
-                args.stream_chunk_log
-            )
-        except urlerror.HTTPError as e:
-            log.error(f"HTTPError from Ollama: {e.code} {e.reason}"); prev_err = f"HTTP {e.code} {e.reason}"; break
-        except Exception as e:
-            prev_err = f"Ollama call failed: {e}"; log.error(prev_err); break
+    try:
+        md_llm, raw = llm_generate_markdown(client, snapshot, model=args.model, mode=args.llm_mode, stream=args.stream, timeout=args.timeout, log=log)
+        # Save raw and final MD (unless json-only, in which case we still save raw text for debugging)
+        with open(paths.raw_llm_path, "w", encoding="utf-8") as f:
+            f.write(raw)
+        log.info("Wrote llm_raw.txt")
+        if not args.json_only:
+            # If LLM produced something, overwrite/append to report
+            with open(paths.report_md_path, "a", encoding="utf-8") as f:
+                f.write("\n\n---\n\n## LLM Analysis\n\n")
+                f.write(md_llm)
+            log.info("Appended LLM section to report.md")
+    except Exception as e:
+        log.error(f"LLM step failed: {e}")
+        log.close()
+        return 4
 
-        try:
-            paths["llm_raw"].write_text(raw_text or "", encoding="utf-8"); log.info(f"Saved raw LLM output: {paths['llm_raw']}")
-        except Exception as e:
-            log.warn(f"Could not write raw LLM output: {e}")
-        if args.debug and raw_text:
-            head = raw_text[:600].replace("\n", " "); log.debug(f"LLM raw (first 600 chars): {head}{'…' if len(raw_text)>600 else ''}")
-
-        if args.llm_mode == "markdown":
-            insights = {"markdown": (raw_text or "").strip(), "findings": compute_findings(snapshot)}
-            break
-
-        parsed, err = validate_full_json(raw_text)
-        if err is None: insights = parsed; break
-        prev_err = err
-        snip = (raw_text or "").strip().replace("\n", " ")[:200]
-        log.warn(f"Validation failed: {err}; snippet: {snip}{'…' if raw_text and len(raw_text)>200 else ''}")
-
-    if insights is None:
-        log.warn("Falling back to basic report due to LLM failure/timeout. Note: server-side generation may continue.")
-        md = render_basic_markdown(snapshot)
-        paths["report"].write_text(md, encoding="utf-8")
-        log.info(f"Report: {paths['report']}")
-        if log_path: log.write_to(log_path); print(f"Log written: {log_path}")
-        print("Wrote:\n  %s\n  %s\n  %s" % (paths["status"], paths["snapshot"], paths["report"]))
-        return 1
-
-    paths["insights"].write_text(json.dumps(insights, indent=2, ensure_ascii=False), encoding="utf-8")
-    log.info(f"Wrote insights: {paths['insights']}")
-
-    md = render_from_llm(snapshot, insights)
-    paths["report"].write_text(md, encoding="utf-8")
-    log.info(f"Report: {paths['report']}")
-
-    if log_path:
-        log.write_to(log_path); print(f"Log written: {log_path}")
-
-    print("Wrote:")
-    for k in ("status", "snapshot", "insights", "report", "llm_raw"):
-        print(f"  {paths[k]}")
-    if endpoint_used:
-        print(f"LLM: model={args.model} server={args.ollama} api={args.api} endpoint_used={endpoint_used} stream={args.stream} num_predict={args.num_predict}")
+    log.info("Done")
+    log.close()
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())

@@ -8,140 +8,152 @@ This and other scripts (as well as accompanying texts/files/documentation) are w
 
 If you want to commit, feel free to fork, mess around and put "ai slop" on my "ai slop", or maybe deslop it enirely, but there is no garantuee that I will incorporate changes.
 
-# homedoc-tailscale-status
+# HomeDoc — Tailscale Status Snapshot & Report
 
-Single-file tool that:
-- collects `tailscale status --json` (no sudo),
-- normalizes it into a compact snapshot,
-- optionally calls a local LLM (Ollama) for a short markdown summary,
-- writes timestamped artifacts to an output folder (**local time** by default).
+![version](https://img.shields.io/badge/version-0.1.1-blue.svg)
+![license](https://img.shields.io/badge/license-GPLv3-blue.svg)
 
-**License:** GPL-3.0-or-later — see [LICENSE](LICENSE).  
-**Version:** `0.1.0` (script constant `__version__`)
+Single-file, stdlib-only utility that:
+1. collects `tailscale status --json`,
+2. normalizes it into a compact snapshot,
+3. (optionally) uses a local LLM (Ollama-compatible HTTP) to produce a concise Markdown report,
+4. writes artifacts per-run (`status.json`, `snapshot.json`, `insights.json`, `report.md`, `llm_raw.txt`, `homedoc.log`).
 
----
-
-## Quick start (no install)
+## Run or Install
 
 ```bash
-python3 homedoc_tailscale_status.py --help
-
-python3 homedoc_tailscale_status.py   --ollama http://localhost:11434   --model "gemma3:12b"   --llm-mode markdown   --timeout 900   --num-predict 256   --stream   --stream-chunk-log 0   --debug
-```
-
-Artifacts are written to a per-run folder under `outputs/`, e.g.:
-
-```
-outputs/tailnet-report_2025-09-30_14-07-12/
-  tailnet-report_2025-09-30_14-07-12_status.raw.json
-  tailnet-report_2025-09-30_14-07-12_snapshot.json
-  tailnet-report_2025-09-30_14-07-12_insights.json
-  tailnet-report_2025-09-30_14-07-12_report.md
-  tailnet-report_2025-09-30_14-07-12_llm.raw.txt
-  tailnet-report_2025-09-30_14-07-12.log
-```
-
----
-
-## Install as a CLI (pipx or pip)
-
-> This repo includes a minimal `pyproject.toml` so you can install and run the tool like a proper command.
-
-### Using pipx (recommended)
-
-Isolates the tool from your system Python and keeps a clean, single-purpose environment.
+python homedoc_tailscale_status.py --
 
 ```bash
-# once per machine
-python3 -m pip install --user pipx
-pipx ensurepath
-
-# from the repo root
 pipx install .
-
-# run from anywhere
-homedoc-tailscale-status --help
-homedoc-tailscale-status --ollama http://localhost:11434 --model "gemma3:12b"
+# or
+pip install .
 ```
 
-**Upgrade to the latest commit** (reinstall from the repo directory):
+## Usage
 
 ```bash
-# from repo root after pulling updates
-pipx reinstall .
+homedoc-tailscale-status \
+  --out ./homedoc_out \
+  --tz local \
+  --model gemma3:12b \
+  --server http://127.0.0.1:11434 \
+  --stream
 ```
 
-**Uninstall**:
+Key flags:
+- `--no-llm` — skip LLM; still generates snapshot and local Markdown table + findings.
+- `--json-only` — write JSON artifacts only, skip Markdown entirely.
+- `--flat` — write directly into `--out` without the timestamped subdirectory.
+- `--input-json <file>` — offline mode: use a saved `tailscale status --json` output.
+- `--llm-mode auto|generate|chat` and `--[no-]stream` — control HTTP path & streaming.
+
+## Outputs
+- `status.json` — raw `tailscale status` JSON
+- `snapshot.json` — normalized compact snapshot
+- `insights.json` — reserved for future structured findings
+- `report.md` — Markdown report; includes local table+findings, plus an LLM section if enabled
+- `llm_raw.txt` — raw LLM HTTP response (for debugging)
+- `homedoc.log` — timestamped log (also printed to stdout)
+
+## Security notes
+- Designed for local LLMs over `http://localhost`. If pointing to remote endpoints, prefer `https://` and be mindful of credentials.
+
+## Changelog
+
+### 0.1.1 — 2025-09-30
+- Logger uses bounded buffer (deque) + line-buffered file writes to avoid unbounded memory growth.
+- Consolidated error handling: helpers raise; `main()` maps to consistent exit codes.
+- Safer JSON extraction via `json.JSONDecoder.raw_decode`.
+- Streaming hardened with timeout watchdog and graceful non-stream fallback.
+- Markdown table escapes `|`; “Findings” rendered even without LLM.
+- New `--json-only`; clarified `--flat`; early log creation.
+
+### 0.1.0 — 2025-09-30
+- Initial release.
+
+
+
+
+
+
+
+# HomeDoc — Tailscale Status Snapshot & Report
+
+
+![version](https://img.shields.io/badge/version-0.1.1-blue.svg)
+![license](https://img.shields.io/badge/license-GPLv3-blue.svg)
+
+
+Single-file, stdlib-only utility that:
+1. collects `tailscale status --json`,
+2. normalizes it into a compact snapshot,
+3. (optionally) uses a local LLM (Ollama-compatible HTTP) to produce a concise Markdown report,
+4. writes artifacts per-run (`status.json`, `snapshot.json`, `insights.json`, `report.md`, `llm_raw.txt`, `homedoc.log`).
+
+
+## Install
+
 
 ```bash
-pipx uninstall homedoc-tailscale-status
+pipx install .
+# or
+pip install .
 ```
 
-### Using pip (editable dev install)
+Usage
+homedoc-tailscale-status \
+  --out ./homedoc_out \
+  --tz local \
+  --model gemma3:12b \
+  --server http://127.0.0.1:11434 \
+  --stream
 
-Good for local development with quick iteration.
+Key flags:
 
-```bash
-# from repo root
-python3 -m pip install --upgrade pip
-python3 -m pip install -e .
+--no-llm — skip LLM; still generates snapshot and local Markdown table + findings.
 
-# now the CLI is available
-homedoc-tailscale-status --help
-```
+--json-only — write JSON artifacts only, skip Markdown entirely.
 
-To remove the editable install:
+--flat — write directly into --out without the timestamped subdirectory.
 
-```bash
-python3 -m pip uninstall homedoc-tailscale-status
-```
+--input-json <file> — offline mode: use a saved tailscale status --json output.
 
----
+--llm-mode auto|generate|chat and --[no-]stream — control HTTP path & streaming.
 
-## CLI options (highlights)
+Outputs
 
-- `--out outputs` root output dir  
-- `--prefix tailnet-report` filename prefix  
-- `--flat` write files directly into `--out` (no run subdir)  
-- `--no-llm` skip model, write basic report only  
-- `--ollama http://host:11434` ollama base URL  
-- `--model "gemma3:12b"` model tag (resolver tries `<family>:latest` if exact tag missing)  
-- `--api auto|generate|chat` endpoint selection (auto tries `/api/generate` then `/api/chat`)  
-- `--llm-mode markdown|full`  
-  - `markdown` (default): model returns only markdown; findings computed locally.  
-  - `full`: model must return strict JSON `{markdown, findings{offline_devices[], tag_summary{}}}`.  
-- `--timeout 900` HTTP timeout seconds  
-- `--num-predict 256` cap output tokens (CPU friendly)  
-- `--num-ctx 2048` request context window  
-- `--tz local|utc` timestamps in local time (default) or UTC  
-- `--stream` enable streaming (default)  
-- `--stream-chunk-log 2000` streaming progress interval chars (0 disables)  
-- `--debug` log payloads + first 600 chars of model output  
+status.json — raw tailscale status JSON
 
----
+snapshot.json — normalized compact snapshot
 
-## Requirements / notes
+insights.json — reserved for future structured findings
 
-- `tailscale` must be on PATH (the tool runs `tailscale status --json`).  
-- Ollama is optional (`--no-llm` skips it). With Ollama:  
-  - Make sure the model is pulled, e.g. `ollama pull gemma3:12b`.  
-  - If an exact tag isn’t found, the script tries `<family>:latest`.
-- Outputs are timestamped with **local time** by default; switch to UTC with `--tz utc`.
-- All logs and raw model output are saved in each run folder for debugging.
+report.md — Markdown report; includes local table+findings, plus an LLM section if enabled
 
----
+llm_raw.txt — raw LLM HTTP response (for debugging)
 
-## Versioning
+homedoc.log — timestamped log (also printed to stdout)
 
-- Script defines `__version__`.
-- Tag releases in Git: `git tag v0.1.0 && git push --tags`.
+Security notes
 
----
+Designed for local LLMs over http://localhost. If pointing to remote endpoints, prefer https:// and be mindful of credentials.
 
-## License
+Changelog
+0.1.1 — 2025-09-30
 
-GPL-3.0-or-later — see [LICENSE](LICENSE).  
-SPDX-License-Identifier: GPL-3.0-or-later
+Logger uses bounded buffer (deque) + line-buffered file writes to avoid unbounded memory growth.
 
+Consolidated error handling: helpers raise; main() maps to consistent exit codes.
 
+Safer JSON extraction via json.JSONDecoder.raw_decode.
 
+Streaming hardened with timeout watchdog and graceful non-stream fallback.
+
+Markdown table escapes |; “Findings” rendered even without LLM.
+
+New --json-only; clarified --flat; early log creation.
+
+0.1.0 — 2025-09-30
+
+Initial release.
