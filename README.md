@@ -138,12 +138,6 @@ python3 -m pip uninstall homedoc-tailscale-status
 
 ---
 
-## Why a `pyproject.toml`? (short)
-
-It declares project metadata and a console script so you can install and run `homedoc-tailscale-status` as a command via `pipx install .`. You don’t need it to *run* the script, but it makes packaging and CLI usage trivial. (We’re intentionally **not** adding tool configs like Black/Ruff now; you can add them later if/when needed.)
-
----
-
 ## License
 
 GPL-3.0-or-later — see [LICENSE](LICENSE).  
