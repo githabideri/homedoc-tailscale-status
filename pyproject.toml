@@ -1,0 +1,15 @@
+[project]
+name = "homedoc-tailscale-status"
+version = "0.1.0"
+description = "Collect tailscale status, normalize, and optionally summarize with a local LLM; writes timestamped artifacts."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "GPL-3.0-or-later" }
+authors = [{ name = "Your Name" }]
+
+[project.scripts]
+homedoc-tailscale-status = "homedoc_tailscale_status:main"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
