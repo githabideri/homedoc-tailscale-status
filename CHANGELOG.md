@@ -6,10 +6,10 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [0.1.2] - 2025-10-01
 ### Fixed
-- Improved error handling for `--input-json` snapshots to gracefully report malformed data instead of crashing.
+- Hardened `--input-json` parsing so malformed snapshots trigger a clear error instead of a crash.
 
 ### Documentation
-- Added a complete CLI usage guide (including bare `python` invocation) in the README and the new `USAGE.md` reference.
+- Expanded end-to-end CLI guidance: refreshed the README quickstart and added the dedicated `USAGE.md` reference guide.
 
 ## [0.1.1] - 2025-09-30
 ### Added

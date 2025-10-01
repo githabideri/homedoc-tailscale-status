@@ -70,8 +70,8 @@ See [USAGE.md](USAGE.md) for a full rundown of every CLI option, defaults, and e
 ## Changelog
 
 ### 0.1.2 — 2025-10-01
-- Fixed error handling when parsing input JSON snapshots to avoid crashes on malformed data.
-- Documented end-to-end CLI usage, including a full example bare `python` invocation and reference guide.
+- Hardened `--input-json` parsing so malformed snapshots are reported cleanly instead of crashing the run.
+- Expanded docs: refreshed the README quickstart and added a dedicated `USAGE.md` reference guide.
 
 ### 0.1.1 — 2025-09-30
 - Logger uses bounded buffer (deque) + line-buffered file writes to avoid unbounded memory growth.
