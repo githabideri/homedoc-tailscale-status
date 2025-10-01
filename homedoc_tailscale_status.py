@@ -35,6 +35,7 @@ import urllib.error
 import urllib.request
 from collections import deque
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
 __version__ = "0.1.1"
@@ -154,6 +155,30 @@ def run_tailscale_status_json(timeout: int, *, log: Logger) -> Dict[str, Any]:
     except json.JSONDecodeError as e:
         raise ValueError("tailscale returned non-JSON output") from e
     return data
+
+
+def _load_status_from_input(path: str, *, log: Logger) -> Dict[str, Any]:
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except FileNotFoundError:
+        log.error(f"Input JSON not found: {path}")
+        log.close()
+        sys.exit(1)
+    except PermissionError as e:
+        log.error(f"Permission denied reading input JSON {path}: {e}")
+        log.close()
+        sys.exit(1)
+    except OSError as e:
+        log.error(f"Failed to read input JSON {path}: {e}")
+        log.close()
+        sys.exit(1)
+
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as e:
+        log.error(f"Input JSON is not valid JSON ({path}): {e}")
+        log.close()
+        sys.exit(1)
 
 
 # ---------------------------- Normalization ---------------------------------
@@ -498,8 +523,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     # Collect status
     try:
         if args.input_json:
-            with open(args.input_json, "r", encoding="utf-8") as f:
-                status = json.load(f)
+            status = _load_status_from_input(args.input_json, log=log)
             log.info(f"Loaded input JSON: {args.input_json}")
         else:
             status = run_tailscale_status_json(args.timeout, log=log)
