@@ -10,7 +10,7 @@ If you want to commit, feel free to fork, mess around and put "ai slop" on my "a
 
 # HomeDoc — Tailscale Status Snapshot & Report
 
-![version](https://img.shields.io/badge/version-0.1.1-blue.svg)
+![version](https://img.shields.io/badge/version-0.1.2-blue.svg)
 ![license](https://img.shields.io/badge/license-GPLv3-blue.svg)
 
 Single-file, stdlib-only utility that:
@@ -22,9 +22,15 @@ Single-file, stdlib-only utility that:
 ## Run or Install
 
 ```bash
-python homedoc_tailscale_status.py --
+# Run directly from the repo (no install)
+python homedoc_tailscale_status.py \
+  --out ./homedoc_out \
+  --tz local \
+  --model gemma3:12b \
+  --server http://127.0.0.1:11434 \
+  --stream
 
-```bash
+# Install locally
 pipx install .
 # or
 pip install .
@@ -48,6 +54,8 @@ Key flags:
 - `--input-json <file>` — offline mode: use a saved `tailscale status --json` output.
 - `--llm-mode auto|generate|chat` and `--[no-]stream` — control HTTP path & streaming.
 
+See [USAGE.md](USAGE.md) for a full rundown of every CLI option, defaults, and examples.
+
 ## Outputs
 - `status.json` — raw `tailscale status` JSON
 - `snapshot.json` — normalized compact snapshot
@@ -60,6 +68,10 @@ Key flags:
 - Designed for local LLMs over `http://localhost`. If pointing to remote endpoints, prefer `https://` and be mindful of credentials.
 
 ## Changelog
+
+### 0.1.2 — 2025-10-01
+- Fixed error handling when parsing input JSON snapshots to avoid crashes on malformed data.
+- Documented end-to-end CLI usage, including a full example bare `python` invocation and reference guide.
 
 ### 0.1.1 — 2025-09-30
 - Logger uses bounded buffer (deque) + line-buffered file writes to avoid unbounded memory growth.

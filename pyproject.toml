@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "homedoc-tailscale-status"
-version = "0.1.1"
+version = "0.1.2"
 description = "Collects Tailscale status, normalizes snapshot, and optionally uses a local LLM to generate a Markdown report with findings."
 readme = "README.md"
 requires-python = ">=3.9"
