@@ -8,7 +8,7 @@ Single-file, stdlib-only utility that:
   3) (optionally) queries a local LLM via HTTP to produce a Markdown report with findings,
   4) writes artifacts into a per-run folder with a local-time timestamp (unless --flat).
 
-v0.1.1 (2025-09-30)
+v0.1.2 (2025-10-01)
 - Logger uses bounded buffer (deque) to avoid unbounded memory growth; optional live file streaming
 - Consolidated error handling: helpers raise; main() maps to consistent exit codes
 - Safer JSON extraction using json.JSONDecoder.raw_decode (replacing manual brace walker)
@@ -38,7 +38,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 
 DEFAULT_MODEL = os.environ.get("HOMEDOC_LLM_MODEL", "gemma3:12b")
 DEFAULT_SERVER = os.environ.get("HOMEDOC_LLM_SERVER", "http://127.0.0.1:11434")
