@@ -44,7 +44,7 @@ homedoc-tailscale-status \
 | `--debug` | Emit verbose logging to stdout and log file. | Disabled |
 | `--log-file PATH` | Write logs to an explicit path instead of `OUT/<run>/homedoc.log`. | `None` (auto) |
 | `--timeout SECONDS` | Timeout for `tailscale` subprocess and LLM HTTP calls. | `60` (via `HOMEDOC_HTTP_TIMEOUT`) |
-| `--input-json FILE` | Use a saved `tailscale status --json` output instead of calling `tailscale`. | Requires readable file |
+| `--input-json FILE` | Use a saved `tailscale status --json` output instead of calling `tailscale`; malformed files now produce a clear error instead of a crash. | Requires readable file |
 | `--no-llm` | Skip LLM call; still writes snapshot and Markdown table/findings. | Disabled |
 | `--json-only` | Only emit JSON artifacts (`status.json`, `snapshot.json`, `insights.json`). | Disabled |
 | `--llm-mode {auto,generate,chat}` | Select Ollama HTTP path preference. | `auto` (via `HOMEDOC_LLM_MODE`) |

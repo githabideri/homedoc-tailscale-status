@@ -9,13 +9,8 @@ Single-file, stdlib-only utility that:
   4) writes artifacts into a per-run folder with a local-time timestamp (unless --flat).
 
 v0.1.2 (2025-10-01)
-- Logger uses bounded buffer (deque) to avoid unbounded memory growth; optional live file streaming
-- Consolidated error handling: helpers raise; main() maps to consistent exit codes
-- Safer JSON extraction using json.JSONDecoder.raw_decode (replacing manual brace walker)
-- Streaming hardened: clearer timeouts, minimal-progress watchdog, graceful fallback
-- Markdown table escapes pipe characters; short findings section even without LLM
-- CLI: new --json-only flag; clarified --flat semantics; early logging of resolved model tag
-- Minor FS improvements: create output dir & open log early; line-buffered writes
+- Hardened `--input-json` parsing so malformed snapshots are reported cleanly instead of crashing the run.
+- Expanded docs: refreshed the README quickstart and added a dedicated `USAGE.md` reference guide.
 
 License: GPLv3
 """
